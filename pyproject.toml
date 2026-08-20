@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "falcon-oauthlib"
+dynamic = ["version"]
+description = 'Falcon OAuthLib integration'
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+keywords = []
+authors = [
+  { name = "Vytautas Liuolia", email = "vytautas.liuolia@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+  "falcon >= 4.0",
+  "oauthlib >= 3.0",
+]
+
+[project.urls]
+Issues = "https://github.com/falconry/falcon-oauthlib/issues"
+Source = "https://github.com/falconry/falcon-oauthlib"
+
+[tool.hatch.version]
+path = "src/falcon_oauthlib/__about__.py"
+
+[tool.coverage.run]
+source_pkgs = ["falcon_oauthlib", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/falcon_oauthlib/__about__.py",
+]
+
+[tool.coverage.paths]
+falcon_oauthlib = ["src/falcon_oauthlib", "*/falcon-oauthlib/src/falcon_oauthlib"]
+tests = ["tests", "*/falcon-oauthlib/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 79
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = ["C9", "E", "F", "W", "I"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+single-line-exclusions = [
+    "typing",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
