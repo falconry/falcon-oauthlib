@@ -27,6 +27,8 @@ classifiers = [
 dependencies = [
   "falcon >= 4.0",
   "oauthlib >= 3.0",
+  "cryptography >= 42.0",
+  "pyjwt >= 2.8",
 ]
 
 [project.urls]

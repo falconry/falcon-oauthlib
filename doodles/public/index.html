@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PKCE client (doodle)</title>
+    <link rel="stylesheet" href="/app/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>OAuth&nbsp;2.1 PKCE client</h1>
+      <p class="hint">
+        A pure browser client. It generates a <code>code_verifier</code> in-session,
+        sends the S256 <code>code_challenge</code> to <code>/authorize</code>, then
+        trades the code for a token at <code>/token</code> once we're redirected back.
+      </p>
+      <p id="status" role="status">Ready.</p>
+      <pre id="result" hidden></pre>
+    </main>
+    <script src="/app/app.js"></script>
+  </body>
+</html>
