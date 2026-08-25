@@ -349,12 +349,16 @@ class DoodleValidator(RequestValidator):
         # `code` is a dict like {'code': '<actual>'}; `request.client` was
         # populated by validate_client_id.
         logging.info(f'save_authorization_code{(client_id, code["code"])}')
+        # Enforce OAuth 2.1 / RFC 9728: only S256 is allowed.
+        if request.code_challenge_method and request.code_challenge_method != 'S256':
+            raise errors.UnsupportedCodeChallengeMethodError()
         AUTHORIZATION_CODES[code['code']] = AuthorizationCode(
             client=request.client,
             scopes=_scopes_to_list(request.scopes),
             redirect_uri=request.redirect_uri,
             code=code['code'],
-            expires_at=datetime.datetime.now(datetime.timezone.utc),
+            expires_at=datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(seconds=10),
             # PKCE: persist the challenge so /token can verify the verifier.
             challenge=request.code_challenge,
             challenge_method=request.code_challenge_method,
@@ -473,6 +477,12 @@ class DoodleValidator(RequestValidator):
         if auth_code is None:
             return False
         if auth_code.client.client_id != client_id:
+            return False
+        # Reject expired codes.
+        if (
+            auth_code.expires_at
+            and datetime.datetime.now(datetime.timezone.utc) >= auth_code.expires_at
+        ):
             return False
         request.scopes = _scopes_to_list(auth_code.scopes)
         request.user = auth_code.user
@@ -600,6 +610,12 @@ class AuthorizationResource:
             resp.content_type = falcon.MEDIA_HTML
             resp.text = html.getvalue()
 
+        # Client errors that should NOT be embedded in a redirect URI:
+        # e.g. MissingCodeChallengeError (PKCE mandatory) and
+        # UnsupportedCodeChallengeMethodError.
+        except errors.InvalidRequestError as e:
+            raise falcon.HTTPBadRequest(description=str(e))
+
         # Errors that should be shown to the user on the provider website
         except errors.FatalClientError as e:
             raise falcon.HTTPBadRequest(description=str(e))
@@ -640,6 +656,12 @@ class AuthorizationResource:
             return
 
         except errors.FatalClientError as e:
+            raise falcon.HTTPBadRequest(description=str(e))
+
+        # Client errors that should NOT be embedded in a redirect URI:
+        # e.g. UnsupportedCodeChallengeMethodError (our S256-only gate) and
+        # MissingCodeChallengeError (PKCE mandatory).
+        except errors.InvalidRequestError as e:
             raise falcon.HTTPBadRequest(description=str(e))
 
 
