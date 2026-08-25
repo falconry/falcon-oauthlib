@@ -1,5 +1,8 @@
+import base64
+import binascii
 import dataclasses
 import datetime
+import hmac
 import io
 import json
 import logging
@@ -33,11 +36,17 @@ class Client:
     client_id: str
     grant_types: list[str]
     scopes: list[str]
-    # Confidential (client-credentials) clients present a signed JWT
-    # (RFC 7521 private_key_jwt) proving they hold the matching private key.
-    # The server stores only the client's PUBLIC JWK Set. Public
-    # (authorization-code + PKCE) clients leave this None.
+    # Confidential (client-credentials) clients can authenticate a
+    # client_credentials token request two ways:
+    #  - RFC 7521 private_key_jwt: the client presents a signed JWT proving it
+    #    holds the matching private key; the server stores only the client's
+    #    PUBLIC JWK Set.
+    #  - RFC 6749 §2.3.1 client_secret: the client presents a shared secret
+    #    either as an HTTP Basic Authorization header (client_secret_basic)
+    #    or as a `client_secret` body parameter (client_secret_post).
+    # Public (authorization-code + PKCE) clients leave both None.
     jwks: dict | None = None
+    client_secret: str | None = None
     # Only set for authorization-code clients (e.g. "code").
     response_type: str | None = None
     redirect_uris: list[str] = dataclasses.field(default_factory=list)
@@ -81,6 +90,12 @@ def _resolve_mock_jwks() -> dict | None:
         return None
 
 
+# A DOODLE-ONLY shared secret for the confidential client (test fixture!).
+# Real deployments must never commit or ship client secrets: generate a
+# high-entropy secret, store it in a secret manager, and treat any log/backup
+# exposure as a credential leak.
+MOCK_CLIENT_SECRET = 'doodle-only-mock-secret-not-for-production'
+
 CLIENTS = (
     # Public client (browser SPA): OAuth 2.1 authorization code + PKCE.
     Client(
@@ -93,11 +108,14 @@ CLIENTS = (
     # Confidential client: Client Credentials grant (no end-user, no redirect).
     # RFC 7521: authenticates with a private_key_jwt client_assertion; we keep
     # only the matching PUBLIC JWK Set (client retains its private key).
+    # It may ALSO authenticate with its shared secret (client_secret_basic /
+    # client_secret_post, RFC 6749 §2.3.1) - the mock secret is a test fixture.
     Client(
         client_id='01m0mkfnh10bjd947gp1pq3h5q',
         grant_types=['client_credentials'],
         scopes=['read'],
         jwks=_resolve_mock_jwks(),
+        client_secret=MOCK_CLIENT_SECRET,
     ),
 )
 
@@ -150,6 +168,36 @@ def _req_param(request, name):
     if isinstance(params, dict):
         return params.get(name)
     return getattr(request, name, None)
+
+
+def _auth_header(request):
+    """Find the client's ``Authorization`` header (any case) in
+    ``request.headers``; oauthlib does not parse it for us."""
+    headers = getattr(request, 'headers', None)
+    if not isinstance(headers, dict):
+        return None
+    for key, value in headers.items():
+        if str(key).lower() == 'authorization':
+            return value
+    return None
+
+
+def _parse_basic_auth(auth_header):
+    """Parse an HTTP Basic Authorization header into (client_id, secret).
+
+    Returns (None, None) for any header that is not well-formed Basic
+    auth. `client_id` may legitimately be present while `client_secret`
+    is None (RFC 6749 §2.3.1 allows the secret to be empty only for
+    public clients, which never use client_secret here).
+    """
+    if not auth_header or not auth_header.lower().startswith('basic '):
+        return None, None
+    try:
+        decoded = base64.b64decode(auth_header[6:].strip(), validate=True)
+        client_id, _, secret = decoded.decode('utf-8').partition(':')
+    except (binascii.Error, UnicodeDecodeError):
+        return None, None
+    return client_id, secret
 
 
 def _select_jwk(jwks, kid):
@@ -335,29 +383,75 @@ class DoodleValidator(RequestValidator):
         return None
 
     def client_authentication_required(self, request, *args, **kwargs):
-        # The client presented a client_assertion we must validate (RFC 7521).
+        # The client must be authenticated if it presents ANY supported
+        # credential: a client_assertion (RFC 7521 private_key_jwt), a Basic
+        # Authorization header (client_secret_basic), or a client_secret body
+        # parameter (client_secret_post). Public clients (no credentials)
+        # fall through to authenticate_client_id().
         logging.info(f'client_authentication_required<{request}>')
-        return _req_param(request, 'client_assertion') is not None
+        return (
+            _req_param(request, 'client_assertion') is not None
+            or _parse_basic_auth(_auth_header(request))[0] is not None
+            or _req_param(request, 'client_secret') is not None
+        )
+
+    @staticmethod
+    def _authenticate_with_client_secret(request, client_id, client):
+        """Authenticate via a shared secret (RFC 6749 §2.3.1).
+
+        Accepts either client_secret_basic (``Authorization: Basic`` with
+        ``client_id:client_secret``) or client_secret_post (``client_secret``
+        body parameter). The credential is taken from whichever channel the
+        client used; comparing them against the registered secret is a
+        constant-time check. Returns True (and sets request.client) on
+        success.
+        """
+        if client is None or not client.client_secret or not client_id:
+            return False
+        header_id, header_secret = _parse_basic_auth(_auth_header(request))
+        secret = _req_param(request, 'client_secret')
+        if header_secret is not None:
+            # client_secret_basic: the ID in the header must also match the
+            # ID the client claims to be (no cross-client secret reuse).
+            if header_id != client_id:
+                return False
+            candidate = header_secret
+        elif secret is not None:
+            # client_secret_post
+            candidate = secret
+        else:
+            return False
+        if hmac.compare_digest(candidate, client.client_secret):
+            request.client = client
+            return True
+        return False
 
     def authenticate_client(self, request, *args, **kwargs):
-        # RFC 7521 §7.2 - private_key_jwt. Thin oauthlib adapter over the
-        # reusable verify_client_assertion(): resolve the client, then verify
-        # the assertion. NOTE: oauthlib requires request.client on success.
+        # Authenticate a confidential client. Two RFC-sanctioned methods are
+        # supported, tried in order of specificity:
+        #  1. client_secret_basic / client_secret_post (RFC 6749 §2.3.1) when
+        #     the client presents a secret, and
+        #  2. RFC 7521 §7.2 private_key_jwt, via the reusable
+        #     verify_client_assertion().
+        # NOTE: oauthlib requires request.client on success.
         logging.info(f'authenticate_client<{request}>')
 
         client_id = _req_param(request, 'client_id')
         client = self._find_client(client_id) if client_id else None
+        if self._authenticate_with_client_secret(request, client_id, client):
+            return True
+
         if client is None or client.jwks is None:
             return False
-        if not verify_client_assertion(
+        if verify_client_assertion(
             assertion=_req_param(request, 'client_assertion'),
             jwks=client.jwks,
             client_id=client_id,
             assertion_type=_req_param(request, 'client_assertion_type'),
         ):
-            return False
-        request.client = client
-        return True
+            request.client = client
+            return True
+        return False
 
     def authenticate_client_id(self, client_id, request, *args, **kwargs):
         # The client_id must match a PUBLIC (non-confidential) client - one

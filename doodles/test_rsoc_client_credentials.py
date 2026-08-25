@@ -1,10 +1,14 @@
-"""Live ``client_credentials`` + ``private_key_jwt`` check for the doodle AS.
+"""Live ``client_credentials`` checks for the doodle AS.
 
-Exercises the Client Credentials grant using an RFC 7521 ``private_key_jwt``
-client assertion, via ``requests_oauth2client``. The doodle stores only the
-client's PUBLIC JWK Set, so the PRIVATE key lives on the client side and is in
-``doodles/keys/mock-client.pem``; the registered ``client_id`` and scope are
-read from ``doodles/server.py``.
+Exercises the Client Credentials grant two ways, via
+``requests_oauth2client``:
+
+* RFC 7521 ``private_key_jwt``: the doodle stores only the client's PUBLIC
+  JWK Set, so the PRIVATE key lives on the client side and is in
+  ``doodles/keys/mock-client.pem``; the registered ``client_id`` and scope
+  are read from ``doodles/server.py``.
+* RFC 6749 §2.3.1 ``client_secret``: ``client_secret_basic`` and
+  ``client_secret_post``, using the mock shared secret in server.py.
 
 Prereqs (this hits the running server, so it is a live/demo check, not part of
 the library unit suite):
@@ -16,10 +20,12 @@ Run directly:
 
     python doodles/test_rsoc_client_credentials.py
 
-It performs two checks:
+It performs four checks:
 
 1. a VALID assertion signed with the registered key  -> 200 + Bearer token
 2. the SAME registered key, but a WRONG aud claim   -> 401 (invalid_client)
+3. the registered client_SECRET via Basic header / body  -> 200 + Bearer token
+4. a WRONG client_secret                              -> 401 (invalid_client)
 """
 
 from __future__ import annotations
@@ -29,11 +35,17 @@ from pathlib import Path
 
 import requests
 from jwskate import Jwk
+from requests_oauth2client import ClientSecretBasic
+from requests_oauth2client import ClientSecretPost
 from requests_oauth2client import OAuth2Client
 from requests_oauth2client import OAuth2Error
 from requests_oauth2client import PrivateKeyJwt
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import server  # noqa: E402  (doodle AS: registered mock secret)
 
 # Match the doodle's confidential (client_credentials) client and its endpoint.
 TOKEN_ENDPOINT = 'http://localhost:8000/token'
@@ -119,6 +131,59 @@ def rejected_case() -> bool:
     return False
 
 
+def _secret_client(auth) -> OAuth2Client:
+    """Build an OAuth2Client that authenticates with a ``client_secret``.
+
+    ``auth`` is either ``ClientSecretBasic`` (HTTP ``Authorization: Basic``,
+    the recommended method per RFC 9700) or ``ClientSecretPost`` (the
+    ``client_secret`` body parameter). ``testing=True`` only relaxes
+    endpoint-URI validation (the doodle is plain http, not https); it does
+    not weaken request/TLS security.
+    """
+    return OAuth2Client(TOKEN_ENDPOINT, auth=auth, testing=True)
+
+
+def secret_ok_case(auth_name: str, auth) -> bool:
+    print(
+        f'\n[{auth_name}] client_credentials + client_secret via '
+        f'{type(auth).__name__}  -> expect 200'
+    )
+    try:
+        token = _secret_client(auth).client_credentials(scope=SCOPE)
+    except OAuth2Error as exc:
+        print(f'    FAIL: the server rejected the client_secret: {exc}')
+        return False
+    print(f'    token_type    : {token.token_type!r}')
+    print(f'    access_token  : {token.access_token[:40]!r}...')
+    print(f'    scope         : {token.scope!r}')
+    print(f'    refresh_token : {token.refresh_token!r}')
+    assert token.access_token, 'expected an access token'
+    assert SCOPE in str(token.scope), (
+        f'expected {SCOPE!r} in scope, got {token.scope!r}'
+    )
+    assert not token.refresh_token, (
+        'client_credentials MUST NOT return a refresh token (RFC 6749 §4.4.3)'
+    )
+    print('    OK: bearer token for the registered scope, no refresh token')
+    return True
+
+
+def secret_rejected_case() -> bool:
+    wrong_secret = 'definitely-not-the-registered-secret'
+    print(f'\n[4] registered client, WRONG client_secret '
+          f'({wrong_secret})  -> expect 401')
+    try:
+        _secret_client(ClientSecretBasic(CLIENT_ID, wrong_secret)).client_credentials(
+            scope=SCOPE
+        )
+    except OAuth2Error as exc:
+        print(f'    token endpoint returned: {exc}')
+        print('    OK: the shared secret was rejected (invalid_client)')
+        return True
+    print('    FAIL: server accepted a client_secret that was never registered')
+    return False
+
+
 def main() -> int:
     if not _server_up():
         print(
@@ -127,11 +192,24 @@ def main() -> int:
         )
         return 2
 
-    results = [ok_case(), rejected_case()]
+    secret = server.MOCK_CLIENT_SECRET
+    results = [
+        ok_case(),
+        rejected_case(),
+        secret_ok_case(
+            '3a',
+            ClientSecretBasic(CLIENT_ID, secret),
+        ),
+        secret_ok_case(
+            '3b',
+            ClientSecretPost(CLIENT_ID, secret),
+        ),
+        secret_rejected_case(),
+    ]
     if all(results):
         print(
-            '\nAll client_credentials / private_key_jwt checks passed against '
-            f'{TOKEN_ENDPOINT}'
+            '\nAll client_credentials checks (private_key_jwt and '
+            f'client_secret) passed against {TOKEN_ENDPOINT}'
         )
         return 0
     print('\nOne or more checks failed.')

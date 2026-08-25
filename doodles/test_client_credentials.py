@@ -1,4 +1,5 @@
-"""Reference tests for RFC 7521 (private_key_jwt) client-credentials auth.
+"""Reference tests for RFC 7521 (private_key_jwt) and RFC 6749 §2.3.1
+(client_secret_basic / client_secret_post) client-credentials auth.
 
 These live with the ``doodles/`` reference integration (next to ``server.py``)
 until the verification primitives are ported into the ``falcon_oauthlib``
@@ -113,16 +114,16 @@ def confidential_client(jwks):
     )
 
 
-def post_token(body, clients):
+def post_token(body, clients, extra_headers=None):
     """Drive the real /token endpoint with a temporary client roster."""
     original = server.CLIENTS
     server.CLIENTS = clients
     try:
         app = server.create_app()
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        headers.update(extra_headers or {})
         return falcon.testing.TestClient(app).simulate_post(
-            '/token',
-            body=body,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            '/token', body=body, headers=headers
         )
     finally:
         server.CLIENTS = original
@@ -318,3 +319,161 @@ def test_endpoint_public_client_cannot_use_grant(keypair):
         (public_client(), confidential_client(jwks)),
     )
     assert r.status_code in (400, 401)
+
+
+# --- client_secret authentication (RFC 6749 §2.3.1) ------------------------
+
+
+def confidential_client_with_secret(jwks=None, client_secret=None):
+    return server.Client(
+        client_id='secret-client-01',
+        grant_types=['client_credentials'],
+        scopes=['read'],
+        jwks=jwks,
+        client_secret=client_secret,
+    )
+
+
+SECRET = 'a-very-long-doodle-shared-secret-0123456789'
+
+
+def _basic_header(client_id, secret):
+    import base64
+
+    raw = f'{client_id}:{secret}'.encode()
+    return f'Basic {base64.b64encode(raw).decode("ascii")}'
+
+
+def _secret_token_body(client_id, post=False):
+    parts = [
+        'grant_type=client_credentials',
+        f'client_id={client_id}',
+        f'scope=read',
+    ]
+    if post:
+        parts.append('client_secret=' + urllib.parse.quote_plus(SECRET))
+    return '&'.join(parts)
+
+
+def test_endpoint_client_secret_basic():
+    r = post_token(
+        _secret_token_body('secret-client-01'),
+        (public_client(), confidential_client_with_secret(client_secret=SECRET)),
+        extra_headers={'Authorization': _basic_header('secret-client-01', SECRET)},
+    )
+    assert r.status_code == 200
+    body = r.json
+    assert body['token_type'] == 'Bearer'
+    assert body['scope'] == 'read'
+    assert body['access_token']
+    assert 'refresh_token' not in body
+
+
+def test_endpoint_client_secret_post():
+    r = post_token(
+        _secret_token_body('secret-client-01', post=True),
+        (public_client(), confidential_client_with_secret(client_secret=SECRET)),
+    )
+    assert r.status_code == 200
+    assert r.json['token_type'] == 'Bearer'
+
+
+def test_endpoint_client_secret_basic_wrong_secret():
+    r = post_token(
+        _secret_token_body('secret-client-01'),
+        (public_client(), confidential_client_with_secret(client_secret=SECRET)),
+        extra_headers={
+            'Authorization': _basic_header('secret-client-01', 'attacker-secret')
+        },
+    )
+    assert r.status_code == 401
+    assert r.json['error'] == 'invalid_client'
+
+
+def test_endpoint_client_secret_post_wrong_secret():
+    body = '&'.join(
+        [
+            'grant_type=client_credentials',
+            'client_id=secret-client-01',
+            'client_secret=attacker-secret',
+        ]
+    )
+    r = post_token(
+        body,
+        (public_client(), confidential_client_with_secret(client_secret=SECRET)),
+    )
+    assert r.status_code == 401
+    assert r.json['error'] == 'invalid_client'
+
+
+def test_endpoint_client_secret_basic_id_mismatch():
+    # Header claims a different client_id than the body -> reject.
+    r = post_token(
+        _secret_token_body('secret-client-01'),
+        (public_client(), confidential_client_with_secret(client_secret=SECRET)),
+        extra_headers={'Authorization': _basic_header('another-client', SECRET)},
+    )
+    assert r.status_code == 401
+
+
+def test_endpoint_client_secret_without_registered_secret():
+    # No registered secret and no JWKS: the client cannot authenticate at all
+    # with a secret.
+    r = post_token(
+        _secret_token_body('secret-client-01'),
+        (public_client(), confidential_client_with_secret()),
+        extra_headers={'Authorization': _basic_header('secret-client-01', SECRET)},
+    )
+    assert r.status_code == 401
+    r = post_token(
+        _secret_token_body('secret-client-01', post=True),
+        (public_client(), confidential_client_with_secret()),
+    )
+    assert r.status_code == 401
+
+
+def test_endpoint_public_client_cannot_use_client_secret():
+    # The public SPA client registered NO secret: neither the Basic header nor
+    # the body parameter may ever succeed for it, even with a well-formed
+    # credential.
+    clients = (
+        public_client(),
+        confidential_client_with_secret(client_secret=SECRET),
+    )
+    r = post_token(
+        'grant_type=client_credentials&client_id=public-spa-client',
+        clients,
+        extra_headers={
+            'Authorization': _basic_header('public-spa-client', SECRET)
+        },
+    )
+    assert r.status_code == 401
+    r = post_token(
+        'grant_type=client_credentials&client_id=public-spa-client&client_secret='
+        + urllib.parse.quote_plus(SECRET),
+        clients,
+    )
+    assert r.status_code == 401
+
+
+def test_endpoint_secret_client_also_accepts_private_key_jwt(keypair):
+    # A client may be registered for BOTH methods; each must keep working.
+    jwks, _, pem = keypair
+    client = confidential_client_with_secret(
+        jwks=jwks, client_secret=SECRET
+    )
+    client.client_id = CID  # assertion iss/sub must match the request client
+    # private_key_jwt path still works...
+    r = post_token(
+        _token_body(CID, mint(make_claims(server.TOKEN_ENDPOINT), pem)),
+        (public_client(), client),
+    )
+    assert r.status_code == 200
+    # ...as does the secret path.
+    r = post_token(
+        'grant_type=client_credentials&client_id='
+        + CID
+        + '&client_secret=' + urllib.parse.quote_plus(SECRET),
+        (public_client(), client),
+    )
+    assert r.status_code == 200
